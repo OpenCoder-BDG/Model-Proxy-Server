@@ -1,0 +1,33 @@
+# Core ML Libraries
+jax==0.6.1
+jaxlib==0.6.1
+flax==0.10.6
+transformers==4.52.4
+torch==2.7.0+cpu
+torch_xla==2.7.0
+
+# API and Web Framework
+fastapi==0.115.12
+uvicorn[standard]
+requests
+pydantic
+python-multipart
+
+# HuggingFace Integration
+huggingface_hub==0.32.3
+datasets==3.6.0
+accelerate==1.7.0
+sentencepiece
+tokenizers
+
+# Utilities
+numpy
+pandas
+aiofiles
+python-jose[cryptography]
+passlib[bcrypt]
+
+# Development and Debugging
+pytest
+pytest-asyncio
+httpx
