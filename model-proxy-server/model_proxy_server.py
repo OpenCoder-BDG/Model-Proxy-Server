@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Enhanced Model Proxy Server - Individual user endpoints with unique API keys
-Similar to llm_proxy but for HuggingFace models with TPU support
+Production-Grade Model Proxy Server
+High-performance HuggingFace model deployment platform with OpenAI API compatibility
 """
 
 import asyncio
@@ -14,25 +14,35 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+import threading
 
 import requests
 import torch
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import jax
 import jax.numpy as jnp
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/mnt/models/proxy_server.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# Global state for user deployments
+# Production-grade global state with thread safety
 USER_DEPLOYMENTS: Dict[str, Dict] = {}
 ACTIVE_MODELS: Dict[str, Any] = {}
+WEBSOCKET_CONNECTIONS: Dict[str, WebSocket] = {}
+_deployment_lock = threading.Lock()
 
 
 def is_model_compatible(model_info) -> tuple[bool, str]:
@@ -71,94 +81,256 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Models
+# Enhanced Pydantic Models for Production
 class ModelSearchRequest(BaseModel):
-    query: str
-    limit: int = 10
+    query: str = Field(..., min_length=1, max_length=100, description="Search query for models")
+    limit: int = Field(default=12, ge=1, le=50, description="Maximum number of results")
+    filter_type: Optional[str] = Field(default="text-generation", description="Model type filter")
 
 class ModelDeployRequest(BaseModel):
-    model_name: str
-    backend: str = "transformers"
-    api_key_enabled: bool = True
-    user_id: Optional[str] = None
+    model_name: str = Field(..., min_length=1, max_length=200, description="HuggingFace model name")
+    backend: str = Field(default="transformers", regex="^(transformers|jax)$", description="Model backend")
+    api_key_enabled: bool = Field(default=True, description="Enable API key authentication")
+    user_id: Optional[str] = Field(default=None, description="Optional user ID")
+    max_memory_gb: Optional[int] = Field(default=8, ge=1, le=32, description="Maximum memory allocation")
 
 class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: List[Dict[str, str]]
-    max_tokens: int = 100
-    temperature: float = 0.7
-    stream: bool = False
+    model: str = Field(..., description="Model identifier")
+    messages: List[Dict[str, str]] = Field(..., min_items=1, description="Chat messages")
+    max_tokens: int = Field(default=512, ge=1, le=4096, description="Maximum tokens to generate")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
+    stream: bool = Field(default=False, description="Stream response")
+    top_p: Optional[float] = Field(default=0.9, ge=0.0, le=1.0, description="Top-p sampling")
+    frequency_penalty: Optional[float] = Field(default=0.0, ge=-2.0, le=2.0, description="Frequency penalty")
 
-# Utility functions
+class DeploymentStatus(BaseModel):
+    user_id: str
+    model_name: str
+    status: str = Field(..., regex="^(deploying|ready|error|stopped)$")
+    progress: int = Field(default=0, ge=0, le=100)
+    message: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    created_at: datetime
+    ready_at: Optional[datetime] = None
+
+# Enhanced Utility Functions
 def generate_api_key() -> str:
-    """Generate a secure API key"""
-    return f"sk-{secrets.token_urlsafe(32)}"
+    """Generate a secure API key with proper prefix"""
+    return f"mp-{secrets.token_urlsafe(32)}"
 
 def generate_user_id() -> str:
-    """Generate a unique user ID"""
-    return str(uuid.uuid4())
+    """Generate a unique user ID with timestamp"""
+    timestamp = int(time.time())
+    return f"user-{timestamp}-{str(uuid.uuid4())[:8]}"
 
 def get_external_ip() -> str:
-    """Get external IP of the instance"""
-    try:
-        response = requests.get("http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip", 
-                              headers={"Metadata-Flavor": "Google"}, timeout=5)
-        return response.text.strip()
-    except:
-        return "34.44.140.182"  # Fallback
+    """Get external IP with multiple fallback methods"""
+    methods = [
+        # Google Cloud metadata
+        lambda: requests.get(
+            "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip",
+            headers={"Metadata-Flavor": "Google"}, timeout=3
+        ).text.strip(),
+        # AWS metadata
+        lambda: requests.get("http://169.254.169.254/latest/meta-data/public-ipv4", timeout=3).text.strip(),
+        # External services
+        lambda: requests.get("https://api.ipify.org", timeout=3).text.strip(),
+        lambda: requests.get("https://icanhazip.com", timeout=3).text.strip(),
+    ]
+    
+    for method in methods:
+        try:
+            ip = method()
+            if ip and ip != "":
+                logger.info(f"External IP detected: {ip}")
+                return ip
+        except Exception as e:
+            logger.debug(f"IP detection method failed: {e}")
+            continue
+    
+    # Final fallback
+    logger.warning("Could not detect external IP, using localhost")
+    return "localhost"
 
-def search_huggingface_models(query: str, limit: int = 10) -> List[Dict]:
-    """Search HuggingFace models using their API"""
+async def broadcast_status_update(user_id: str, status_data: dict):
+    """Broadcast status updates via WebSocket"""
+    if user_id in WEBSOCKET_CONNECTIONS:
+        try:
+            websocket = WEBSOCKET_CONNECTIONS[user_id]
+            await websocket.send_json({
+                "type": "deployment_status",
+                "user_id": user_id,
+                "data": status_data
+            })
+        except Exception as e:
+            logger.error(f"Failed to send WebSocket update: {e}")
+            # Remove dead connection
+            WEBSOCKET_CONNECTIONS.pop(user_id, None)
+
+def validate_model_compatibility(model_name: str) -> tuple[bool, str]:
+    """Enhanced model compatibility checking"""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        model_info = api.model_info(model_name)
+        
+        # Check model tags
+        tags = getattr(model_info, 'tags', [])
+        library_name = getattr(model_info, 'library_name', '')
+        
+        # Incompatible formats
+        incompatible_patterns = [
+            'mlx', 'gguf', 'onnx', 'openvino', 'tensorrt', 
+            'tflite', 'coreml', 'paddle'
+        ]
+        
+        for tag in tags:
+            for pattern in incompatible_patterns:
+                if pattern in tag.lower():
+                    return False, f"Incompatible format: {tag}"
+        
+        if library_name.lower() in incompatible_patterns:
+            return False, f"Incompatible library: {library_name}"
+        
+        # Check model size (basic heuristic)
+        if hasattr(model_info, 'safetensors') and model_info.safetensors:
+            total_size = sum(
+                file_info.get('size', 0) 
+                for file_info in model_info.safetensors.get('parameters', {}).values()
+            )
+            # Warn if model is very large (>16GB)
+            if total_size > 16 * 1024**3:
+                return False, f"Model too large: {total_size / (1024**3):.1f}GB"
+        
+        return True, "Compatible"
+        
+    except Exception as e:
+        logger.error(f"Error validating model {model_name}: {e}")
+        return False, f"Validation error: {str(e)}"
+
+async def search_huggingface_models(query: str, limit: int = 12, filter_type: str = "text-generation") -> List[Dict]:
+    """Enhanced HuggingFace model search with filtering and validation"""
     try:
         url = "https://huggingface.co/api/models"
         params = {
             "search": query,
-            "limit": limit,
-            "filter": "text-generation",
+            "limit": min(limit * 2, 50),  # Get more to filter
+            "filter": filter_type,
             "sort": "downloads",
             "direction": -1
         }
         
-        response = requests.get(url, params=params, timeout=10)
+        logger.info(f"Searching for models: {query}")
+        response = requests.get(url, params=params, timeout=15)
         response.raise_for_status()
         
         models = response.json()
-        
-        # Format for our UI
         formatted_models = []
+        
         for model in models:
-            formatted_models.append({
-                "id": model.get("id", ""),
-                "name": model.get("id", ""),
+            model_id = model.get("id", "")
+            if not model_id:
+                continue
+                
+            # Validate model compatibility
+            is_compatible, reason = validate_model_compatibility(model_id)
+            
+            # Get model size estimate
+            size_info = "Unknown size"
+            try:
+                if 'safetensors' in model.get('tags', []):
+                    size_info = "Optimized (safetensors)"
+                elif any(tag in model.get('tags', []) for tag in ['pytorch', 'tf']):
+                    size_info = "Standard format"
+            except:
+                pass
+            
+            formatted_model = {
+                "id": model_id,
+                "name": model_id,
                 "downloads": model.get("downloads", 0),
                 "likes": model.get("likes", 0),
-                "tags": model.get("tags", []),
-                "description": model.get("description", "")[:200] + "..." if model.get("description", "") else ""
-            })
+                "tags": model.get("tags", [])[:5],  # Limit tags
+                "description": (model.get("description", "") or "No description available")[:180] + "...",
+                "library_name": model.get("library_name", "transformers"),
+                "pipeline_tag": model.get("pipeline_tag", "text-generation"),
+                "size_info": size_info,
+                "compatible": is_compatible,
+                "compatibility_reason": reason,
+                "model_index": model.get("modelIndex", {}),
+                "created_at": model.get("createdAt", ""),
+                "updated_at": model.get("lastModified", "")
+            }
+            
+            # Only include compatible models in main results
+            if is_compatible:
+                formatted_models.append(formatted_model)
+                
+            if len(formatted_models) >= limit:
+                break
         
+        logger.info(f"Found {len(formatted_models)} compatible models")
         return formatted_models
+        
     except Exception as e:
         logger.error(f"Error searching HuggingFace models: {e}")
-        # Fallback to popular models
+        # Enhanced fallback with popular, tested models
         return [
-            {"id": "gpt2", "name": "gpt2", "downloads": 1000000, "likes": 500, "tags": ["text-generation"], "description": "GPT-2 is a transformers model pretrained on a very large corpus of English data"},
-            {"id": "microsoft/DialoGPT-medium", "name": "microsoft/DialoGPT-medium", "downloads": 500000, "likes": 200, "tags": ["conversational"], "description": "Large-scale pretraining for dialogue generation"},
-            {"id": "google/flan-t5-base", "name": "google/flan-t5-base", "downloads": 300000, "likes": 150, "tags": ["text2text-generation"], "description": "FLAN-T5 Base model for instruction following"},
-            {"id": "microsoft/DialoGPT-small", "name": "microsoft/DialoGPT-small", "downloads": 200000, "likes": 100, "tags": ["conversational"], "description": "Smaller version of DialoGPT for dialogue generation"},
-            {"id": "distilgpt2", "name": "distilgpt2", "downloads": 150000, "likes": 80, "tags": ["text-generation"], "description": "Distilled version of GPT-2"}
+            {
+                "id": "microsoft/DialoGPT-medium", "name": "microsoft/DialoGPT-medium",
+                "downloads": 2500000, "likes": 350, "tags": ["conversational", "pytorch"],
+                "description": "A large-scale pretrained dialogue response generation model optimized for conversational AI applications",
+                "library_name": "transformers", "pipeline_tag": "conversational", "size_info": "~1.2GB",
+                "compatible": True, "compatibility_reason": "Compatible"
+            },
+            {
+                "id": "gpt2", "name": "gpt2",
+                "downloads": 5000000, "likes": 1200, "tags": ["text-generation", "pytorch"],
+                "description": "GPT-2 is a transformers model pretrained on a very large corpus of English data in a self-supervised fashion",
+                "library_name": "transformers", "pipeline_tag": "text-generation", "size_info": "~500MB",
+                "compatible": True, "compatibility_reason": "Compatible"
+            },
+            {
+                "id": "google/flan-t5-base", "name": "google/flan-t5-base",
+                "downloads": 1800000, "likes": 280, "tags": ["text2text-generation", "pytorch"],
+                "description": "FLAN-T5 base model fine-tuned on a collection of datasets phrased as instructions",
+                "library_name": "transformers", "pipeline_tag": "text2text-generation", "size_info": "~900MB",
+                "compatible": True, "compatibility_reason": "Compatible"
+            },
+            {
+                "id": "microsoft/DialoGPT-small", "name": "microsoft/DialoGPT-small",
+                "downloads": 1200000, "likes": 180, "tags": ["conversational", "pytorch"],
+                "description": "A smaller, faster version of DialoGPT optimized for resource-constrained environments",
+                "library_name": "transformers", "pipeline_tag": "conversational", "size_info": "~350MB",
+                "compatible": True, "compatibility_reason": "Compatible"
+            },
+            {
+                "id": "distilgpt2", "name": "distilgpt2",
+                "downloads": 800000, "likes": 150, "tags": ["text-generation", "pytorch"],
+                "description": "Distilled version of GPT-2: smaller, faster, yet preserving 95% of GPT-2 performance",
+                "library_name": "transformers", "pipeline_tag": "text-generation", "size_info": "~300MB",
+                "compatible": True, "compatibility_reason": "Compatible"
+            }
         ]
 
-async def load_model_async(model_name: str, backend: str = "transformers") -> Dict:
-    """Load model asynchronously with proper model type detection"""
+async def load_model_async(user_id: str, model_name: str, backend: str = "transformers", max_memory_gb: int = 8) -> Dict:
+    """Enhanced model loading with progress tracking and error handling"""
     try:
-        logger.info(f"Loading model {model_name} with {backend} backend")
+        logger.info(f"Loading model {model_name} for user {user_id} with {backend} backend")
+        
+        # Update status to starting
+        await update_deployment_status(user_id, "deploying", 10, "Initializing model loading...")
 
         # Create model directory
         model_dir = f"/mnt/models/user_models/{model_name.replace('/', '_')}"
         os.makedirs(model_dir, exist_ok=True)
+        os.makedirs("/mnt/models/huggingface_cache", exist_ok=True)
 
         if backend == "transformers":
-            # First, get model info to determine the correct model type
+            # Get model info and validate
+            await update_deployment_status(user_id, "deploying", 20, "Fetching model information...")
+            
             from huggingface_hub import HfApi
             api = HfApi()
             model_info = api.model_info(model_name)
@@ -166,16 +338,25 @@ async def load_model_async(model_name: str, backend: str = "transformers") -> Di
             
             logger.info(f"Model {model_name} has pipeline tag: {pipeline_tag}")
             
-            # Load tokenizer
+            # Load tokenizer first
+            await update_deployment_status(user_id, "deploying", 40, "Loading tokenizer...")
+            
             tokenizer = AutoTokenizer.from_pretrained(
                 model_name,
                 cache_dir="/mnt/models/huggingface_cache",
-                trust_remote_code=True
+                trust_remote_code=True,
+                use_fast=True
             )
 
             # Add pad token if missing
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
+                
+            # Determine optimal torch dtype and device configuration
+            device_config = "auto" if torch.cuda.is_available() else "cpu"
+            torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            
+            await update_deployment_status(user_id, "deploying", 60, "Loading model weights...")
 
             # Load appropriate model based on pipeline tag
             if pipeline_tag == "text2text-generation":
@@ -184,8 +365,10 @@ async def load_model_async(model_name: str, backend: str = "transformers") -> Di
                     model_name,
                     cache_dir="/mnt/models/huggingface_cache",
                     trust_remote_code=True,
-                    torch_dtype=torch.float32,
-                    device_map="auto" if torch.cuda.is_available() else "cpu"
+                    torch_dtype=torch_dtype,
+                    device_map=device_config,
+                    low_cpu_mem_usage=True,
+                    max_memory={0: f"{max_memory_gb}GB"} if torch.cuda.is_available() else None
                 )
                 task = "text2text-generation"
             else:
@@ -194,706 +377,341 @@ async def load_model_async(model_name: str, backend: str = "transformers") -> Di
                     model_name,
                     cache_dir="/mnt/models/huggingface_cache",
                     trust_remote_code=True,
-                    torch_dtype=torch.float32,
-                    device_map="auto" if torch.cuda.is_available() else "cpu"
+                    torch_dtype=torch_dtype,
+                    device_map=device_config,
+                    low_cpu_mem_usage=True,
+                    max_memory={0: f"{max_memory_gb}GB"} if torch.cuda.is_available() else None
                 )
                 task = "text-generation"
 
-            # Create pipeline with correct task
+            await update_deployment_status(user_id, "deploying", 80, "Creating inference pipeline...")
+
+            # Create optimized pipeline
             pipe = pipeline(
                 task,
                 model=model,
                 tokenizer=tokenizer,
-                device_map="auto" if torch.cuda.is_available() else "cpu"
+                device_map=device_config,
+                torch_dtype=torch_dtype,
+                return_full_text=False if task == "text-generation" else True
             )
 
-            return {
+            await update_deployment_status(user_id, "deploying", 95, "Finalizing deployment...")
+
+            model_data = {
                 "model": model,
                 "tokenizer": tokenizer,
                 "pipeline": pipe,
                 "backend": backend,
                 "task": task,
+                "model_name": model_name,
+                "device": str(model.device) if hasattr(model, 'device') else 'cpu',
+                "dtype": str(torch_dtype),
+                "memory_usage": f"{max_memory_gb}GB limit",
+                "loaded_at": datetime.now().isoformat(),
                 "status": "ready"
             }
+            
+            logger.info(f"Model {model_name} loaded successfully for user {user_id}")
+            return model_data
 
         elif backend == "jax":
-            # JAX implementation would go here
-            # For now, fallback to transformers
-            return await load_model_async(model_name, "transformers")
+            # JAX implementation placeholder
+            await update_deployment_status(user_id, "deploying", 50, "JAX backend not fully implemented, falling back to transformers...")
+            return await load_model_async(user_id, model_name, "transformers", max_memory_gb)
 
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
     except Exception as e:
-        logger.error(f"Error loading model {model_name}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+        error_msg = f"Failed to load model {model_name}: {str(e)}"
+        logger.error(f"Error loading model for user {user_id}: {e}")
+        await update_deployment_status(user_id, "error", 0, error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
 
-# API Routes
-@app.get("/", response_class=HTMLResponse)
-async def get_frontend():
-    """Serve the enhanced frontend"""
-    html_content = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Model Proxy Server</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
-            color: #ffffff;
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 20px;
-            padding: 30px;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        
-        h1 {
-            text-align: center;
-            margin-bottom: 30px;
-            background: linear-gradient(45deg, #9c27b0, #e91e63);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            font-size: 2.5rem;
-            font-weight: bold;
-        }
-        
-        .search-section {
-            margin-bottom: 30px;
-        }
-        
-        .search-box {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-        }
-        
-        input[type="text"] {
-            flex: 1;
-            min-width: 250px;
-            padding: 15px;
-            border: 2px solid #9c27b0;
-            border-radius: 10px;
-            background: rgba(255, 255, 255, 0.1);
-            color: white;
-            font-size: 16px;
-            transition: all 0.3s ease;
-        }
-        
-        input[type="text"]:focus {
-            outline: none;
-            border-color: #e91e63;
-            box-shadow: 0 0 20px rgba(156, 39, 176, 0.3);
-        }
-        
-        input[type="text"]::placeholder {
-            color: rgba(255, 255, 255, 0.6);
-        }
-        
-        button {
-            padding: 15px 25px;
-            border: none;
-            border-radius: 10px;
-            background: linear-gradient(45deg, #9c27b0, #e91e63);
-            color: white;
-            font-size: 16px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            min-width: 120px;
-        }
-        
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 25px rgba(156, 39, 176, 0.3);
-        }
-        
-        button:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
-        .models-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        
-        .model-card {
-            background: rgba(255, 255, 255, 0.08);
-            border-radius: 15px;
-            padding: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            transition: all 0.3s ease;
-            cursor: pointer;
-        }
-        
-        .model-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 35px rgba(156, 39, 176, 0.2);
-            border-color: #9c27b0;
-        }
-        
-        .model-card.selected {
-            border-color: #e91e63;
-            background: rgba(233, 30, 99, 0.1);
-        }
-        
-        .model-name {
-            font-size: 1.2rem;
-            font-weight: bold;
-            margin-bottom: 10px;
-            color: #e91e63;
-        }
-        
-        .model-stats {
-            display: flex;
-            gap: 15px;
-            margin-bottom: 10px;
-            font-size: 0.9rem;
-            color: rgba(255, 255, 255, 0.7);
-        }
-        
-        .model-description {
-            font-size: 0.9rem;
-            color: rgba(255, 255, 255, 0.8);
-            line-height: 1.4;
-        }
-        
-        .deployment-section {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 15px;
-            padding: 25px;
-            margin-bottom: 30px;
-        }
-        
-        .options-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        
-        .option-group {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-        
-        label {
-            font-weight: bold;
-            color: #9c27b0;
-        }
-        
-        select {
-            padding: 12px;
-            border: 2px solid #9c27b0;
-            border-radius: 8px;
-            background: rgba(255, 255, 255, 0.1);
-            color: white;
-            font-size: 14px;
-        }
-        
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        input[type="checkbox"] {
-            width: 20px;
-            height: 20px;
-            accent-color: #e91e63;
-        }
-        
-        .endpoint-info {
-            background: rgba(0, 255, 0, 0.1);
-            border: 2px solid #4caf50;
-            border-radius: 15px;
-            padding: 25px;
-            margin-top: 20px;
-            display: none;
-        }
-        
-        .endpoint-info.show {
-            display: block;
-            animation: slideIn 0.5s ease;
-        }
-        
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateY(-20px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-        
-        .endpoint-item {
-            margin-bottom: 15px;
-            padding: 10px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 8px;
-        }
-        
-        .endpoint-label {
-            font-weight: bold;
-            color: #4caf50;
-            margin-bottom: 5px;
-        }
-        
-        .endpoint-value {
-            font-family: 'Courier New', monospace;
-            background: rgba(0, 0, 0, 0.3);
-            padding: 8px;
-            border-radius: 5px;
-            word-break: break-all;
-        }
-        
-        .status-indicator {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            margin-right: 8px;
-        }
-        
-        .status-ready { background-color: #4caf50; }
-        .status-loading { background-color: #ff9800; animation: pulse 1s infinite; }
-        .status-error { background-color: #f44336; }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        
-        .loading-spinner {
-            border: 3px solid rgba(255, 255, 255, 0.3);
-            border-top: 3px solid #e91e63;
-            border-radius: 50%;
-            width: 30px;
-            height: 30px;
-            animation: spin 1s linear infinite;
-            margin: 20px auto;
-        }
-        
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-        
-        @media (max-width: 768px) {
-            .container {
-                padding: 20px;
-                margin: 10px;
-            }
+async def update_deployment_status(user_id: str, status: str, progress: int, message: str):
+    """Update deployment status and broadcast via WebSocket"""
+    with _deployment_lock:
+        if user_id in USER_DEPLOYMENTS:
+            USER_DEPLOYMENTS[user_id].update({
+                "status": status,
+                "progress": progress,
+                "message": message,
+                "updated_at": datetime.now().isoformat()
+            })
             
-            h1 {
-                font-size: 2rem;
-            }
-            
-            .search-box {
-                flex-direction: column;
-            }
-            
-            input[type="text"] {
-                min-width: 100%;
-            }
-            
-            .models-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .options-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🚀 Model Proxy Server</h1>
-        
-        <div class="search-section">
-            <div class="search-box">
-                <input type="text" id="searchInput" placeholder="Search HuggingFace models...">
-                <button onclick="searchModels()">Search Models</button>
-            </div>
-        </div>
-        
-        <div id="modelsContainer" class="models-grid">
-            <!-- Models will be loaded here -->
-        </div>
-        
-        <div class="deployment-section">
-            <h3>🔧 Deployment Options</h3>
-            <div class="options-grid">
-                <div class="option-group">
-                    <label for="backendSelect">Backend:</label>
-                    <select id="backendSelect">
-                        <option value="transformers">Transformers (Recommended)</option>
-                        <option value="jax">JAX (Experimental)</option>
-                    </select>
-                </div>
-                <div class="option-group">
-                    <div class="checkbox-group">
-                        <input type="checkbox" id="apiKeyEnabled" checked>
-                        <label for="apiKeyEnabled">Enable API Key Protection</label>
-                    </div>
-                </div>
-            </div>
-            <button onclick="deployModel()" id="deployBtn" disabled>
-                <span class="status-indicator status-ready"></span>
-                Deploy Selected Model
-            </button>
-        </div>
-        
-        <div id="endpointInfo" class="endpoint-info">
-            <h3>✅ Model Deployed Successfully!</h3>
-            <div class="endpoint-item">
-                <div class="endpoint-label">Model Name:</div>
-                <div class="endpoint-value" id="modelName"></div>
-            </div>
-            <div class="endpoint-item">
-                <div class="endpoint-label">Base URL:</div>
-                <div class="endpoint-value" id="baseUrl"></div>
-            </div>
-            <div class="endpoint-item" id="apiKeySection">
-                <div class="endpoint-label">API Key:</div>
-                <div class="endpoint-value" id="apiKey"></div>
-            </div>
-            <div class="endpoint-item">
-                <div class="endpoint-label">User ID:</div>
-                <div class="endpoint-value" id="userId"></div>
-            </div>
-            <p style="margin-top: 15px; color: #4caf50;">
-                💡 Copy these details to use with OpenHands or other applications!
-            </p>
-        </div>
-    </div>
+            if status == "ready":
+                USER_DEPLOYMENTS[user_id]["ready_at"] = datetime.now().isoformat()
+    
+    # Broadcast update
+    status_data = {
+        "status": status,
+        "progress": progress,
+        "message": message,
+        "user_id": user_id
+    }
+    
+    await broadcast_status_update(user_id, status_data)
 
-    <script>
-        let selectedModel = null;
-        let deploymentStatus = 'idle';
-        
-        // Search models
-        async function searchModels() {
-            const query = document.getElementById('searchInput').value.trim();
-            if (!query) {
-                alert('Please enter a search query');
-                return;
-            }
-            
-            const container = document.getElementById('modelsContainer');
-            container.innerHTML = '<div class="loading-spinner"></div>';
-            
-            try {
-                const response = await fetch('/search-models', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query, limit: 12 })
-                });
-                
-                const data = await response.json();
-                displayModels(data.models || []);
-            } catch (error) {
-                console.error('Search error:', error);
-                container.innerHTML = '<p style="text-align: center; color: #f44336;">Error searching models. Please try again.</p>';
-            }
-        }
-        
-        // Display models
-        function displayModels(models) {
-            const container = document.getElementById('modelsContainer');
-            
-            if (models.length === 0) {
-                container.innerHTML = '<p style="text-align: center; color: #ff9800;">No models found. Try a different search term.</p>';
-                return;
-            }
-            
-            container.innerHTML = models.map(model => `
-                <div class="model-card" onclick="selectModel('${model.id}', '${model.name}')">
-                    <div class="model-name">${model.name}</div>
-                    <div class="model-stats">
-                        <span>📥 ${model.downloads.toLocaleString()}</span>
-                        <span>❤️ ${model.likes}</span>
-                    </div>
-                    <div class="model-description">${model.description}</div>
-                </div>
-            `).join('');
-        }
-        
-        // Select model
-        function selectModel(modelId, modelName) {
-            // Remove previous selection
-            document.querySelectorAll('.model-card').forEach(card => {
-                card.classList.remove('selected');
-            });
-            
-            // Add selection to clicked card
-            event.currentTarget.classList.add('selected');
-            
-            selectedModel = { id: modelId, name: modelName };
-            document.getElementById('deployBtn').disabled = false;
-            
-            // Hide previous endpoint info
-            document.getElementById('endpointInfo').classList.remove('show');
-        }
-        
-        // Deploy model
-        async function deployModel() {
-            if (!selectedModel) {
-                alert('Please select a model first');
-                return;
-            }
-            
-            const deployBtn = document.getElementById('deployBtn');
-            const statusIndicator = deployBtn.querySelector('.status-indicator');
-            
-            // Update UI for loading state
-            deployBtn.disabled = true;
-            deployBtn.innerHTML = '<span class="status-indicator status-loading"></span>Deploying Model...';
-            deploymentStatus = 'deploying';
-            
-            try {
-                const backend = document.getElementById('backendSelect').value;
-                const apiKeyEnabled = document.getElementById('apiKeyEnabled').checked;
-                
-                const response = await fetch('/deploy-model', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        model_name: selectedModel.id,
-                        backend: backend,
-                        api_key_enabled: apiKeyEnabled
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (response.ok) {
-                    // Poll for deployment status
-                    pollDeploymentStatus(data.user_id);
-                } else {
-                    throw new Error(data.detail || 'Deployment failed');
-                }
-                
-            } catch (error) {
-                console.error('Deployment error:', error);
-                deployBtn.innerHTML = '<span class="status-indicator status-error"></span>Deployment Failed';
-                setTimeout(() => {
-                    deployBtn.innerHTML = '<span class="status-indicator status-ready"></span>Deploy Selected Model';
-                    deployBtn.disabled = false;
-                }, 3000);
-            }
-        }
-        
-        // Poll deployment status
-        async function pollDeploymentStatus(userId) {
-            try {
-                const response = await fetch(`/deployment-status/${userId}`);
-                const data = await response.json();
-                
-                if (data.status === 'ready') {
-                    // Show endpoint information
-                    showEndpointInfo(data);
-                    
-                    const deployBtn = document.getElementById('deployBtn');
-                    deployBtn.innerHTML = '<span class="status-indicator status-ready"></span>Deploy Another Model';
-                    deployBtn.disabled = false;
-                    
-                } else if (data.status === 'error') {
-                    throw new Error(data.error || 'Deployment failed');
-                } else {
-                    // Still deploying, poll again
-                    setTimeout(() => pollDeploymentStatus(userId), 2000);
-                }
-                
-            } catch (error) {
-                console.error('Status polling error:', error);
-                const deployBtn = document.getElementById('deployBtn');
-                deployBtn.innerHTML = '<span class="status-indicator status-error"></span>Deployment Failed';
-                setTimeout(() => {
-                    deployBtn.innerHTML = '<span class="status-indicator status-ready"></span>Deploy Selected Model';
-                    deployBtn.disabled = false;
-                }, 3000);
-            }
-        }
-        
-        // Show endpoint information
-        function showEndpointInfo(data) {
-            document.getElementById('modelName').textContent = data.model_name;
-            document.getElementById('baseUrl').textContent = data.base_url;
-            document.getElementById('userId').textContent = data.user_id;
-            
-            const apiKeySection = document.getElementById('apiKeySection');
-            if (data.api_key) {
-                document.getElementById('apiKey').textContent = data.api_key;
-                apiKeySection.style.display = 'block';
-            } else {
-                apiKeySection.style.display = 'none';
-            }
-            
-            document.getElementById('endpointInfo').classList.add('show');
-        }
-        
-        // Load popular models on page load
-        window.onload = function() {
-            // Default search removed - starts blank
-            searchModels();
-        };
-        
-        // Enter key support for search
-        document.getElementById('searchInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                searchModels();
-            }
-        });
-    </script>
-</body>
-</html>
-    """
-    return HTMLResponse(content=html_content)
+# Enhanced API Routes with WebSocket Support
+@app.get("/")
+async def redirect_to_frontend():
+    """Redirect to main frontend"""
+    return HTMLResponse(content="""
+    <script>window.location.href = '/frontend';</script>
+    <p>Redirecting to frontend...</p>
+    """)
+
+@app.get("/frontend", response_class=HTMLResponse)
+async def serve_frontend():
+    """Serve the main frontend page"""
+    try:
+        with open("frontend.html", "r") as f:
+            return HTMLResponse(content=f.read())
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Frontend not found. Please ensure frontend.html exists.</h1>", status_code=404)
+
+@app.get("/deployment/{user_id}", response_class=HTMLResponse)
+async def serve_deployment_page(user_id: str):
+    """Serve user-specific deployment page"""
+    try:
+        with open("deployment.html", "r") as f:
+            content = f.read().replace("{{USER_ID}}", user_id)
+            return HTMLResponse(content=content)
+    except FileNotFoundError:
+        return HTMLResponse(content="<h1>Deployment page not found.</h1>", status_code=404)
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    """WebSocket endpoint for real-time updates"""
+    await websocket.accept()
+    WEBSOCKET_CONNECTIONS[user_id] = websocket
+    
+    try:
+        while True:
+            # Keep connection alive and handle incoming messages
+            data = await websocket.receive_text()
+            # Echo back for connection testing
+            await websocket.send_json({"type": "pong", "message": "Connection active"})
+    except WebSocketDisconnect:
+        WEBSOCKET_CONNECTIONS.pop(user_id, None)
+        logger.info(f"WebSocket connection closed for user {user_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error for user {user_id}: {e}")
+        WEBSOCKET_CONNECTIONS.pop(user_id, None)
 
 @app.post("/search-models")
 async def search_models(request: ModelSearchRequest):
-    """Search HuggingFace models"""
+    """Enhanced HuggingFace model search with validation"""
     try:
-        models = search_huggingface_models(request.query, request.limit)
-        return {"models": models}
+        logger.info(f"Search request: query='{request.query}', limit={request.limit}")
+        models = await search_huggingface_models(
+            request.query, 
+            request.limit, 
+            request.filter_type or "text-generation"
+        )
+        return {
+            "models": models,
+            "total": len(models),
+            "query": request.query,
+            "filter_type": request.filter_type
+        }
     except Exception as e:
         logger.error(f"Error in search_models: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 @app.post("/deploy-model")
 async def deploy_model(request: ModelDeployRequest, background_tasks: BackgroundTasks):
-    """Deploy a model for a user"""
+    """Enhanced model deployment with validation and progress tracking"""
     try:
+        # Validate model compatibility first
+        is_compatible, reason = validate_model_compatibility(request.model_name)
+        if not is_compatible:
+            raise HTTPException(status_code=400, detail=f"Model incompatible: {reason}")
+        
         # Generate user ID if not provided
         user_id = request.user_id or generate_user_id()
         
         # Generate API key if enabled
         api_key = generate_api_key() if request.api_key_enabled else None
         
-        # Create user deployment entry
-        USER_DEPLOYMENTS[user_id] = {
-            "model_name": request.model_name,
-            "backend": request.backend,
-            "api_key": api_key,
-            "api_key_enabled": request.api_key_enabled,
-            "status": "deploying",
-            "created_at": datetime.now().isoformat(),
-            "base_url": f"http://{get_external_ip()}:8000/user/{user_id}/v1"
-        }
+        external_ip = get_external_ip()
+        base_url = f"http://{external_ip}:8000/user/{user_id}/v1"
+        
+        # Create comprehensive user deployment entry
+        with _deployment_lock:
+            USER_DEPLOYMENTS[user_id] = {
+                "model_name": request.model_name,
+                "backend": request.backend,
+                "api_key": api_key,
+                "api_key_enabled": request.api_key_enabled,
+                "max_memory_gb": request.max_memory_gb,
+                "status": "initializing",
+                "progress": 0,
+                "message": "Deployment queued",
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "base_url": base_url,
+                "external_ip": external_ip,
+                "deployment_url": f"http://{external_ip}:8000/deployment/{user_id}"
+            }
         
         # Start model loading in background
-        background_tasks.add_task(load_user_model, user_id, request.model_name, request.backend)
+        background_tasks.add_task(
+            load_user_model, 
+            user_id, 
+            request.model_name, 
+            request.backend,
+            request.max_memory_gb
+        )
+        
+        logger.info(f"Started deployment for user {user_id}: {request.model_name}")
         
         return {
             "message": f"Deploying model {request.model_name}",
             "user_id": user_id,
             "model_name": request.model_name,
             "backend": request.backend,
-            "api_key_enabled": request.api_key_enabled
+            "api_key_enabled": request.api_key_enabled,
+            "max_memory_gb": request.max_memory_gb,
+            "base_url": base_url,
+            "deployment_url": f"http://{external_ip}:8000/deployment/{user_id}",
+            "websocket_url": f"ws://{external_ip}:8000/ws/{user_id}",
+            "status": "initializing"
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error in deploy_model: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Deployment failed: {str(e)}")
 
-async def load_user_model(user_id: str, model_name: str, backend: str):
-    """Load model for a specific user"""
+async def load_user_model(user_id: str, model_name: str, backend: str, max_memory_gb: int = 8):
+    """Enhanced model loading for a specific user with progress tracking"""
     try:
-        logger.info(f"Loading model {model_name} for user {user_id}")
+        logger.info(f"Starting model loading for user {user_id}: {model_name}")
         
-        # Load the model
-        model_data = await load_model_async(model_name, backend)
+        # Load the model with progress tracking
+        model_data = await load_model_async(user_id, model_name, backend, max_memory_gb)
         
         # Store in active models
         ACTIVE_MODELS[user_id] = model_data
         
-        # Update deployment status
-        USER_DEPLOYMENTS[user_id]["status"] = "ready"
-        USER_DEPLOYMENTS[user_id]["loaded_at"] = datetime.now().isoformat()
+        # Final status update
+        await update_deployment_status(user_id, "ready", 100, "Model deployment completed successfully!")
         
         logger.info(f"Model {model_name} loaded successfully for user {user_id}")
         
     except Exception as e:
         logger.error(f"Error loading model for user {user_id}: {e}")
-        USER_DEPLOYMENTS[user_id]["status"] = "error"
-        USER_DEPLOYMENTS[user_id]["error"] = str(e)
+        await update_deployment_status(user_id, "error", 0, f"Deployment failed: {str(e)}")
+        
+        # Clean up any partial model data
+        ACTIVE_MODELS.pop(user_id, None)
 
 @app.get("/deployment-status/{user_id}")
 async def get_deployment_status(user_id: str):
-    """Get deployment status for a user"""
+    """Enhanced deployment status with comprehensive information"""
     if user_id not in USER_DEPLOYMENTS:
         raise HTTPException(status_code=404, detail="User deployment not found")
     
     deployment = USER_DEPLOYMENTS[user_id]
+    
+    # Add model information if available
+    model_info = {}
+    if user_id in ACTIVE_MODELS:
+        model_data = ACTIVE_MODELS[user_id]
+        model_info = {
+            "device": model_data.get("device", "unknown"),
+            "dtype": model_data.get("dtype", "unknown"),
+            "memory_usage": model_data.get("memory_usage", "unknown"),
+            "task": model_data.get("task", "unknown"),
+            "loaded_at": model_data.get("loaded_at")
+        }
     
     return {
         "user_id": user_id,
         "model_name": deployment["model_name"],
         "backend": deployment["backend"],
         "status": deployment["status"],
+        "progress": deployment.get("progress", 0),
+        "message": deployment.get("message", ""),
         "api_key": deployment.get("api_key"),
         "api_key_enabled": deployment["api_key_enabled"],
         "base_url": deployment["base_url"],
+        "deployment_url": deployment.get("deployment_url"),
+        "websocket_url": f"ws://{deployment.get('external_ip', 'localhost')}:8000/ws/{user_id}",
+        "created_at": deployment["created_at"],
+        "updated_at": deployment.get("updated_at"),
+        "ready_at": deployment.get("ready_at"),
+        "model_info": model_info,
         "error": deployment.get("error")
     }
 
 @app.get("/user/{user_id}/v1/models")
 async def get_user_models(user_id: str):
-    """Get models for a specific user (OpenAI compatible)"""
+    """Enhanced OpenAI-compatible models endpoint"""
     if user_id not in USER_DEPLOYMENTS:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="User deployment not found")
     
     deployment = USER_DEPLOYMENTS[user_id]
     
     if deployment["status"] != "ready":
-        raise HTTPException(status_code=503, detail="Model not ready")
+        raise HTTPException(
+            status_code=503, 
+            detail=f"Model not ready. Status: {deployment['status']}"
+        )
+    
+    # Get additional model information
+    model_info = {}
+    if user_id in ACTIVE_MODELS:
+        model_data = ACTIVE_MODELS[user_id]
+        model_info = {
+            "task": model_data.get("task", "text-generation"),
+            "backend": model_data.get("backend", "transformers"),
+            "device": model_data.get("device", "cpu"),
+            "dtype": model_data.get("dtype", "float32")
+        }
+    
+    created_timestamp = int(datetime.fromisoformat(deployment["created_at"]).timestamp())
     
     return {
         "object": "list",
         "data": [{
             "id": deployment["model_name"],
             "object": "model",
-            "created": int(time.time()),
-            "owned_by": f"user-{user_id}"
+            "created": created_timestamp,
+            "owned_by": f"user-{user_id}",
+            "permission": [],
+            "root": deployment["model_name"],
+            "parent": None,
+            **model_info
         }]
     }
 
 @app.post("/user/{user_id}/v1/chat/completions")
-async def user_chat_completions(user_id: str, request: ChatCompletionRequest):
-    """Chat completions for a specific user (OpenAI compatible)"""
+async def user_chat_completions(user_id: str, request: ChatCompletionRequest, req: Request):
+    """Enhanced OpenAI-compatible chat completions endpoint"""
     if user_id not in USER_DEPLOYMENTS:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="User deployment not found")
     
     deployment = USER_DEPLOYMENTS[user_id]
     
     # Check API key if enabled
     if deployment["api_key_enabled"]:
-        # In a real implementation, you'd check the Authorization header
-        pass
+        auth_header = req.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Missing or invalid API key")
+        
+        provided_key = auth_header.split(" ", 1)[1]
+        if provided_key != deployment.get("api_key"):
+            raise HTTPException(status_code=401, detail="Invalid API key")
     
     if deployment["status"] != "ready":
-        raise HTTPException(status_code=503, detail="Model not ready")
+        raise HTTPException(
+            status_code=503, 
+            detail=f"Model not ready. Status: {deployment['status']}"
+        )
     
     if user_id not in ACTIVE_MODELS:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -901,34 +719,74 @@ async def user_chat_completions(user_id: str, request: ChatCompletionRequest):
     try:
         model_data = ACTIVE_MODELS[user_id]
         pipeline = model_data["pipeline"]
+        task = model_data["task"]
         
-        # Format messages into a single prompt
-        prompt = ""
-        for message in request.messages:
-            role = message["role"]
-            content = message["content"]
-            if role == "user":
-                prompt += f"User: {content}\nAssistant: "
-            elif role == "assistant":
-                prompt += f"{content}\n"
+        # Enhanced prompt formatting based on model task
+        if task == "text2text-generation":
+            # For T5-style models, format differently
+            prompt = ""
+            for message in request.messages:
+                if message["role"] == "user":
+                    prompt += f"Question: {message['content']}\nAnswer: "
+                elif message["role"] == "system":
+                    prompt = f"{message['content']}\n" + prompt
+        else:
+            # For causal LM models
+            prompt = ""
+            for message in request.messages:
+                role = message["role"]
+                content = message["content"]
+                if role == "system":
+                    prompt += f"System: {content}\n"
+                elif role == "user":
+                    prompt += f"User: {content}\nAssistant: "
+                elif role == "assistant":
+                    prompt += f"{content}\n"
         
-        # Generate response
-        response = pipeline(
-            prompt,
-            max_length=len(prompt.split()) + request.max_tokens,
-            temperature=request.temperature,
-            do_sample=True,
-            pad_token_id=pipeline.tokenizer.eos_token_id
-        )
+        # Generate response with enhanced parameters
+        generation_kwargs = {
+            "max_length": len(prompt.split()) + request.max_tokens,
+            "temperature": request.temperature,
+            "do_sample": request.temperature > 0,
+            "pad_token_id": pipeline.tokenizer.eos_token_id,
+            "eos_token_id": pipeline.tokenizer.eos_token_id,
+        }
+        
+        # Add optional parameters if provided
+        if hasattr(request, 'top_p') and request.top_p is not None:
+            generation_kwargs["top_p"] = request.top_p
+        if hasattr(request, 'frequency_penalty') and request.frequency_penalty is not None:
+            generation_kwargs["repetition_penalty"] = 1.0 + request.frequency_penalty
+            
+        response = pipeline(prompt, **generation_kwargs)
         
         # Extract generated text
-        generated_text = response[0]["generated_text"]
-        assistant_response = generated_text[len(prompt):].strip()
+        if isinstance(response, list) and len(response) > 0:
+            generated_text = response[0].get("generated_text", "")
+        else:
+            generated_text = str(response)
+            
+        # Clean up the response
+        if task == "text2text-generation":
+            assistant_response = generated_text.strip()
+        else:
+            assistant_response = generated_text[len(prompt):].strip()
+        
+        # Handle empty responses
+        if not assistant_response:
+            assistant_response = "I apologize, but I couldn't generate a response. Please try rephrasing your question."
+        
+        completion_id = f"chatcmpl-{int(time.time())}-{secrets.token_hex(6)}"
+        created_time = int(time.time())
+        
+        # Calculate token usage (approximate)
+        prompt_tokens = len(prompt.split())
+        completion_tokens = len(assistant_response.split())
         
         return {
-            "id": f"chatcmpl-{int(time.time())}",
+            "id": completion_id,
             "object": "chat.completion",
-            "created": int(time.time()),
+            "created": created_time,
             "model": deployment["model_name"],
             "choices": [{
                 "index": 0,
@@ -939,27 +797,91 @@ async def user_chat_completions(user_id: str, request: ChatCompletionRequest):
                 "finish_reason": "stop"
             }],
             "usage": {
-                "prompt_tokens": len(prompt.split()),
-                "completion_tokens": len(assistant_response.split()),
-                "total_tokens": len(prompt.split()) + len(assistant_response.split())
-            }
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            },
+            "system_fingerprint": f"mp-{user_id[:8]}"
         }
         
     except Exception as e:
         logger.error(f"Error in chat completion for user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Generation failed: {str(e)}"
+        )
 
 @app.get("/status")
 async def get_status():
-    """Get server status"""
-    return {
-        "status": "running",
-        "active_deployments": len(USER_DEPLOYMENTS),
-        "active_models": len(ACTIVE_MODELS),
-        "jax_devices": len(jax.devices()) if jax.devices() else 0,
-        "external_ip": get_external_ip()
-    }
+    """Enhanced server status with detailed information"""
+    try:
+        # Get deployment statistics
+        deployment_stats = {"ready": 0, "deploying": 0, "error": 0, "initializing": 0}
+        for deployment in USER_DEPLOYMENTS.values():
+            status = deployment.get("status", "unknown")
+            deployment_stats[status] = deployment_stats.get(status, 0) + 1
+        
+        # System information
+        import psutil
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        return {
+            "status": "running",
+            "timestamp": datetime.now().isoformat(),
+            "server_info": {
+                "external_ip": get_external_ip(),
+                "port": 8000,
+                "version": "2.0.0-production"
+            },
+            "deployments": {
+                "total": len(USER_DEPLOYMENTS),
+                "active_models": len(ACTIVE_MODELS),
+                "statistics": deployment_stats
+            },
+            "system": {
+                "cpu_percent": cpu_percent,
+                "memory_percent": memory.percent,
+                "memory_available_gb": round(memory.available / (1024**3), 2),
+                "disk_percent": disk.percent,
+                "disk_free_gb": round(disk.free / (1024**3), 2)
+            },
+            "hardware": {
+                "cuda_available": torch.cuda.is_available(),
+                "cuda_devices": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+                "jax_devices": len(jax.devices()) if jax.devices() else 0
+            },
+            "websocket_connections": len(WEBSOCKET_CONNECTIONS)
+        }
+    except Exception as e:
+        logger.error(f"Error getting status: {e}")
+        return {
+            "status": "running",
+            "timestamp": datetime.now().isoformat(),
+            "active_deployments": len(USER_DEPLOYMENTS),
+            "active_models": len(ACTIVE_MODELS),
+            "external_ip": get_external_ip(),
+            "error": str(e)
+        }
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Simple health check for load balancers"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=True)
+    logger.info("Starting Model Proxy Server...")
+    logger.info(f"External IP: {get_external_ip()}")
+    logger.info(f"CUDA Available: {torch.cuda.is_available()}")
+    logger.info(f"JAX Devices: {len(jax.devices())}")
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000, 
+        access_log=True,
+        log_level="info"
+    )
